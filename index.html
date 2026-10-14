@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#161616" />
+  <meta name="description" content="Cinematic, aesthetic colour grading for photos and videos — right on your phone. Nothing is uploaded." />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="GradeLab" />
+  <title>GradeLab</title>
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body data-mtab="looks" class="empty">
+  <header class="topbar">
+    <div class="brand"><span class="dot"></span>GradeLab <small>photo &amp; video colour grading</small></div>
+    <div class="actions">
+      <label class="btn ghost" for="file">Open</label>
+      <input id="file" type="file" accept="image/*,video/*" hidden />
+      <button class="btn ghost desktop-only" id="exportLut" disabled title="Download this grade as a .cube LUT for Premiere, Resolve, Final Cut, Lightroom">.cube LUT</button>
+      <button class="btn primary" id="export" disabled>Export</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="viewer" id="viewer">
+      <div class="drop" id="drop">
+        <div class="drop-inner">
+          <div class="drop-title">Grade a photo or video</div>
+          <div class="drop-sub">Cinematic &amp; aesthetic looks in one tap. Everything is processed on your device — nothing is uploaded.</div>
+          <label class="btn primary big" for="file">Choose from library</label>
+        </div>
+      </div>
+      <div class="stage" id="stage" hidden>
+        <canvas id="canvas"></canvas>
+        <div class="peek" id="peek" hidden></div>
+      </div>
+      <div class="viewer-bar" id="viewerBar" hidden>
+        <div class="video-controls" id="videoControls" hidden>
+          <button class="icon" id="play" aria-label="Play">▶</button>
+          <input type="range" id="seek" min="0" max="1000" value="0" aria-label="Seek" />
+          <span class="time" id="time">0:00</span>
+        </div>
+        <div class="compare">
+          <button class="chip" id="holdOriginal" title="Hold to see the original (or hold the \ key)"><span class="desktop-only">Hold for original</span><span class="mobile-only">Original</span></button>
+          <button class="chip" id="splitToggle" aria-pressed="false">Split</button>
+          <span class="dims" id="dims"></span>
+        </div>
+      </div>
+      <div class="strip" id="strip" hidden>
+        <div class="strip-head">
+          <div class="cats" id="cats" role="tablist" aria-label="Look categories"></div>
+          <span class="hint desktop-only">Hover to preview · click to apply</span>
+        </div>
+        <div class="presets" id="presets"></div>
+      </div>
+      <div class="progress" id="progress" hidden>
+        <div class="progress-card">
+          <div id="progressLabel">Exporting…</div>
+          <div class="bar"><div id="progressFill"></div></div>
+          <button class="btn ghost" id="cancelExport">Cancel</button>
+        </div>
+      </div>
+    </section>
+
+    <aside class="panel" id="panel">
+      <section class="group" data-tab="looks">
+        <div class="group-head"><h2 id="lookName">Original</h2><button class="chip" id="auto" title="Neutralise colour cast and exposure before the look">Auto balance</button></div>
+        <div id="intensityRow"></div>
+      </section>
+
+      <details class="group" data-tab="light" open>
+        <summary><h2>Light</h2></summary>
+        <div id="lightRows"></div>
+      </details>
+
+      <details class="group" data-tab="light" open>
+        <summary><h2>Presence</h2></summary>
+        <div id="presenceRows"></div>
+      </details>
+
+      <details class="group" data-tab="light">
+        <summary><h2>Tone curve</h2></summary>
+        <div class="curve-tabs" id="curveTabs"></div>
+        <canvas id="curve" width="560" height="560" aria-label="Tone curve editor"></canvas>
+        <p class="hint">Drag to shape · tap to add a point · double-tap a point to remove it</p>
+        <button class="chip" id="curveReset">Reset curve</button>
+      </details>
+
+      <details class="group" data-tab="color" open>
+        <summary><h2>Colour</h2></summary>
+        <div id="colorRows"></div>
+      </details>
+
+      <details class="group" data-tab="color">
+        <summary><h2>Colour grading</h2></summary>
+        <div id="wheelRows"></div>
+      </details>
+
+      <details class="group" data-tab="color">
+        <summary><h2>Colour mixer</h2></summary>
+        <div class="bands" id="bands"></div>
+        <div id="mixerRows"></div>
+      </details>
+
+      <details class="group" data-tab="color">
+        <summary><h2>Calibration</h2></summary>
+        <p class="hint">Shift the camera's red, green and blue primaries — the Lightroom trick behind rich teal-and-orange skin and deep cinematic colour.</p>
+        <div id="calRows"></div>
+      </details>
+
+      <details class="group" data-tab="style" open>
+        <summary><h2>Copy a look</h2></summary>
+        <p class="hint">Pick any image you love — a film still, a moodboard pick — and its colour grade is transferred to your shot. Only colour moves; your detail stays.</p>
+        <div class="ref" id="ref">
+          <label class="btn ghost" for="refFile" id="refPick">Choose reference…</label>
+          <input id="refFile" type="file" accept="image/*" hidden />
+          <img id="refThumb" alt="Reference image" hidden />
+          <button class="chip" id="refClear" hidden>Remove</button>
+        </div>
+        <div id="matchRows"></div>
+      </details>
+
+      <details class="group" data-tab="style" open>
+        <summary><h2>Palette grade</h2></summary>
+        <p class="hint">Pull every colour in the frame toward a designed colour scheme.</p>
+        <div class="palettes" id="palettes"></div>
+        <div id="paletteRows"></div>
+      </details>
+
+      <details class="group" data-tab="effects" open>
+        <summary><h2>Cinema finish</h2></summary>
+        <div id="finishRows"></div>
+        <div class="row">
+          <label for="letterbox">Letterbox</label>
+          <select id="letterbox">
+            <option value="0">Off</option>
+            <option value="1.85">1.85 : 1 Flat</option>
+            <option value="2">2.00 : 1 Univisium</option>
+            <option value="2.39">2.39 : 1 Scope</option>
+            <option value="2.76">2.76 : 1 Ultra</option>
+          </select>
+          <span></span>
+        </div>
+      </details>
+
+      <div class="panel-foot" data-tab="effects">
+        <button class="btn ghost" id="reset">Reset all</button>
+        <button class="btn ghost mobile-only" id="exportLutMobile" disabled>Download .cube LUT</button>
+      </div>
+    </aside>
+  </main>
+
+  <nav class="mtabs" id="mtabs" aria-label="Editing tools">
+    <button data-tab="looks" aria-selected="true"><span class="ti">◐</span>Looks</button>
+    <button data-tab="light"><span class="ti">☀</span>Light</button>
+    <button data-tab="color"><span class="ti">◍</span>Color</button>
+    <button data-tab="style"><span class="ti">✦</span>Style</button>
+    <button data-tab="effects"><span class="ti">◎</span>Effects</button>
+  </nav>
+
+  <dialog id="exportDialog">
+    <form method="dialog" class="dialog">
+      <h3>Export</h3>
+      <div id="photoOpts">
+        <label class="radio"><input type="radio" name="fmt" value="image/jpeg" checked /> JPEG (quality 95)</label>
+        <label class="radio"><input type="radio" name="fmt" value="image/png" /> PNG (lossless)</label>
+      </div>
+      <p class="hint" id="exportHint"></p>
+      <div class="dialog-actions">
+        <button class="btn ghost" value="cancel">Cancel</button>
+        <button class="btn primary" value="ok" id="exportGo">Export full resolution</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="saveDialog">
+    <form method="dialog" class="dialog">
+      <h3>Ready</h3>
+      <p class="hint" id="saveHint">Tap Save, then choose “Save Image” to add it to your Photos.</p>
+      <div class="dialog-actions">
+        <button class="btn ghost" value="cancel">Close</button>
+        <button class="btn primary" value="ok" id="saveGo">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <video id="video" playsinline webkit-playsinline preload="auto" hidden></video>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
