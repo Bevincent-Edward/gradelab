@@ -47,6 +47,8 @@ uniform float uHalation;
 uniform float uClarity;
 uniform float uDehaze;
 uniform float uGlow;
+uniform float uRays;
+uniform vec2 uLightPos; // light source for rays, in source (st) coordinates
 uniform float uLetterbox;
 uniform vec2 uRes;
 
@@ -109,6 +111,24 @@ void main() {
     float w = uGlow * 0.6 * smoothstep(0.25, 1.0, luma(g));
     col = 1.0 - (1.0 - col) * (1.0 - g * w);
   }
+  if (uRays > 0.0) {
+    // Light rays (crepuscular "god rays"): march from the pixel toward the light
+    // source through the blurred image, gathering only very bright samples, so
+    // shafts of warm light stream out of windows, sky gaps and sun spots.
+    vec2 dir = (uLightPos - st) / 28.0;
+    vec2 q = st;
+    float acc = 0.0, decay = 1.0;
+    for (int i = 0; i < 28; i++) {
+      q += dir;
+      vec3 b = texture(uBlurA, q).rgb;
+      acc += smoothstep(0.62, 0.98, max(b.r, max(b.g, b.b))) * decay;
+      decay *= 0.955;
+    }
+    acc /= 14.0;
+    float fall = 1.0 - smoothstep(0.0, 1.1, length((st - uLightPos) * vec2(uRes.x / uRes.y, 1.0)));
+    vec3 ray = vec3(1.0, 0.78, 0.46) * acc * (0.35 + 0.65 * fall) * uRays * 0.9;
+    col = 1.0 - (1.0 - col) * (1.0 - clamp(ray, 0.0, 1.0));
+  }
   if (uHalation > 0.0) {
     // Film halation: light scattering back through the film base leaves a warm
     // red-orange fringe *around* bright objects — where the neighbourhood is
@@ -140,7 +160,7 @@ void main() {
 }`;
 
 const MAIN_UNIFORMS = ["uImg", "uLut", "uBlurA", "uBlurB", "uLutSize", "uIntensity", "uVignette", "uGrain", "uSeed",
-  "uSplit", "uHalation", "uClarity", "uDehaze", "uGlow", "uLetterbox", "uRes"];
+  "uSplit", "uHalation", "uClarity", "uDehaze", "uGlow", "uRays", "uLightPos", "uLetterbox", "uRes"];
 
 export class Renderer {
   constructor(canvas) {
@@ -311,6 +331,8 @@ export class Renderer {
     gl.uniform1f(this.u.uClarity, opts.clarity ?? 0);
     gl.uniform1f(this.u.uDehaze, opts.dehaze ?? 0);
     gl.uniform1f(this.u.uGlow, opts.glow ?? 0);
+    gl.uniform1f(this.u.uRays, opts.rays ?? 0);
+    gl.uniform2f(this.u.uLightPos, ...(opts.lightPos ?? [0.5, 0.15]));
     gl.uniform1f(this.u.uLetterbox, opts.letterbox ?? 0);
     gl.uniform2f(this.u.uRes, width, height);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);

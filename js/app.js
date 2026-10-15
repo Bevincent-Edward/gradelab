@@ -39,7 +39,7 @@ const state = {
   split: false,
   holdOriginal: false,
   band: BANDS[0].id,
-  category: "All",
+  category: "Pro Looks",
   peek: null, // params of a look being hovered in the filmstrip
   refStats: null,
   exporting: null,
@@ -82,6 +82,7 @@ const SLIDERS = {
   paletteRows: [["paletteAmt", "Amount", 0, 100, 1]],
   finishRows: [
     ["glow", "Glow", 0, 100, 1],
+    ["rays", "Light rays", 0, 100, 1],
     ["halation", "Halation", 0, 100, 1],
     ["vignette", "Vignette", 0, 100, 1],
     ["grain", "Film grain", 0, 100, 1],
@@ -363,22 +364,23 @@ for (const preset of [null, ...PRESETS]) {
   thumbs.set(preset, c);
 }
 
+function showCategory(cat) {
+  state.category = cat;
+  document.querySelectorAll(".cat").forEach((el) => el.setAttribute("aria-selected", el.textContent === cat));
+  document.querySelectorAll(".preset").forEach((el) => {
+    el.hidden = cat !== "All" && el.dataset.cat !== cat && el.dataset.id !== "";
+  });
+  $("presets").scrollLeft = 0;
+}
 for (const cat of CATEGORIES) {
   const b = document.createElement("button");
   b.className = "cat";
   b.setAttribute("role", "tab");
   b.textContent = cat;
-  b.setAttribute("aria-selected", cat === state.category);
-  b.addEventListener("click", () => {
-    state.category = cat;
-    document.querySelectorAll(".cat").forEach((el) => el.setAttribute("aria-selected", el === b));
-    document.querySelectorAll(".preset").forEach((el) => {
-      el.hidden = cat !== "All" && el.dataset.cat !== cat && el.dataset.id !== "";
-    });
-    $("presets").scrollLeft = 0;
-  });
+  b.addEventListener("click", () => showCategory(cat));
   $("cats").append(b);
 }
+showCategory(state.category);
 
 // ---------------------------------------------------------------- palette grade
 
@@ -412,6 +414,27 @@ function imageDataOf(source, w, h, maxSide = 200) {
   const ctx = c.getContext("2d", { willReadFrequently: true });
   ctx.drawImage(source, 0, 0, c.width, c.height);
   return ctx.getImageData(0, 0, c.width, c.height);
+}
+
+/**
+ * Where light rays should come from: the brightest soft region of the frame
+ * (a window, sun or gap in the canopy), with a gentle preference for the top.
+ */
+function findLightSource() {
+  const src = state.source.kind === "image" ? state.source.bitmap : video;
+  const d = imageDataOf(src, state.source.width, state.source.height, 48);
+  const { width: w, height: h, data } = d;
+  const lum = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) lum[i] = 0.2126 * data[i * 4] + 0.7152 * data[i * 4 + 1] + 0.0722 * data[i * 4 + 2];
+  let best = -1, bx = 0.5, by = 0.15;
+  for (let y = 2; y < h - 2; y++)
+    for (let x = 2; x < w - 2; x++) {
+      let s = 0;
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) s += lum[(y + dy) * w + x + dx];
+      s *= 1.15 - 0.3 * (y / h);
+      if (s > best) { best = s; bx = x / w; by = y / h; }
+    }
+  return [bx, by];
 }
 
 function sourceStats() {
@@ -537,6 +560,8 @@ function shaderOpts(p = state.params) {
     clarity: p.clarity / 100,
     dehaze: p.dehaze / 100,
     glow: p.glow / 100,
+    rays: p.rays / 100,
+    lightPos: state.lightPos,
     letterbox: p.letterbox,
   };
 }
@@ -807,6 +832,7 @@ async function load(file) {
     syncAll();
   }
   if (state.refStats) state.params.match = { src: sourceStats(), ref: state.refStats };
+  state.lightPos = findLightSource();
   renderThumbnails();
   onParamsChanged();
   updateTime();

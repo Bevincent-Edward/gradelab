@@ -55,6 +55,7 @@ export function defaultParams() {
     clarity: 0, // -100..100 midtone local contrast
     dehaze: 0, // -100..100: negative adds airy haze, positive cuts it
     glow: 0, // 0..100 soft dreamy bloom
+    rays: 0, // 0..100 light rays from the brightest light source
     letterbox: 0, // target aspect ratio, 0 = off
   };
 }

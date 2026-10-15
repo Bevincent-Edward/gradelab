@@ -1,9 +1,11 @@
+import { PRO_LOOKS } from "./prolooks.js";
+
 // Looks are deliberately restrained: each one keeps skin protection on (except
 // B&W) and moves colour in OKLab, so subjects stay recognisable and textures
 // intact. Values are partial overrides of defaultParams(). Hues are OKLCH
 // degrees: red≈25, orange≈58, yellow≈100, green≈140, teal≈200, blue≈255, magenta≈340.
 
-export const CATEGORIES = ["All", "Trending", "Signature", "Cinematic", "Film Stock", "Aesthetic", "Film", "Moody", "Nature", "Portrait", "B&W"];
+export const CATEGORIES = ["Pro Looks", "All", "Trending", "Signature", "Cinematic", "Film Stock", "Aesthetic", "Film", "Moody", "Nature", "Portrait", "B&W"];
 
 // Curated colour schemes for palette grading (OKLCH hues).
 export const PALETTES = [
@@ -19,7 +21,7 @@ export const PALETTES = [
   { id: "berry", name: "Berry & Gold", hues: [350, 85] },
 ];
 
-export const PRESETS = [
+const BASE_PRESETS = [
   // ---------------------------------------------------------------- Trending
   // Creator-style looks built the way Lightroom presets are: basic panel,
   // presence (clarity/dehaze), HSL, colour grading, calibration and curves.
@@ -686,3 +688,6 @@ export const PRESETS = [
     },
   },
 ];
+
+// Reference-matched looks first, then the hand-built library.
+export const PRESETS = [...PRO_LOOKS, ...BASE_PRESETS];
