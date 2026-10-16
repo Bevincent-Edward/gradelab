@@ -1385,6 +1385,55 @@ async function pickEncoding(MB, dw, dh, fps) {
   throw new Error(`this device can't encode video at ${Math.round(fps)} fps`);
 }
 
+/**
+ * Where the finished video is written. On phones, keeping a 100+ MB export in
+ * memory (and copying it again for the share sheet) is what pushes iOS over
+ * its limit, so it streams straight into the browser's private file storage
+ * (OPFS) and is shared from there. Falls back to memory where OPFS writing
+ * isn't available.
+ */
+async function exportTarget(MB) {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle("bevgradz-export.mp4", { create: true });
+    const writable = await handle.createWritable();
+    return { target: new MB.StreamTarget(writable, { chunked: true }), result: () => handle.getFile(), onDisk: true };
+  } catch {
+    const target = new MB.BufferTarget();
+    return { target, result: async () => new Blob([target.buffer], { type: "video/mp4" }), onDisk: false };
+  }
+}
+
+/** Frees the preview player's own decoder while exporting; returns a restore function. */
+function suspendPreview() {
+  const url = video.src, time = video.currentTime;
+  video.pause();
+  video.removeAttribute("src");
+  video.load();
+  return async () => {
+    if (!url) return;
+    try {
+      await primeVideo(url);
+      video.currentTime = time;
+      await Promise.race([once(video, "seeked"), timeout(3000)]);
+      uploadVideoPreview();
+      requestDraw();
+    } catch { /* the preview reloads on the next pick */ }
+  };
+}
+
+/** Keeps the screen on during a long export (a locked phone suspends the page). */
+async function keepAwake() {
+  try { return await navigator.wakeLock?.request("screen"); } catch { return null; }
+}
+
+/** First audio track with a codec that can be copied into an MP4 (skips Apple spatial audio). */
+async function pickAudioTrack(input) {
+  const tracks = await input.getAudioTracks();
+  const usable = tracks.filter((t) => t.codec && ["aac", "opus", "mp3", "ac3", "eac3", "flac", "alac"].includes(t.codec));
+  return usable.find((t) => t.codec === "aac") ?? usable[0] ?? null;
+}
+
 /** Real frame rate of a video track, measured from its frames. */
 async function measureFps(track) {
   const stats = await track.computePacketStats(600);
@@ -1405,7 +1454,10 @@ async function exportVideoExact() {
   const input = new MB.Input({ formats: MB.ALL_FORMATS, source: new MB.BlobSource(state.source.file) });
   const track = await input.getPrimaryVideoTrack();
   if (!track || !(await track.canDecode())) throw new Error("Video track can't be decoded here");
-  const audioTrack = await input.getPrimaryAudioTrack();
+  // iPhones record spatial audio (APAC, which nothing outside Apple can decode
+  // or put in an MP4) as the primary track, next to a normal AAC stereo track.
+  // Use the first audio track whose codec can actually be carried over.
+  const audioTrack = await pickAudioTrack(input);
   const duration = (await input.computeDuration()) || video.duration || 1;
   const srcFps = (await measureFps(track)) || state.source.fps || 30;
   state.source.fps = srcFps;
@@ -1441,7 +1493,11 @@ async function exportVideoExact() {
   // graded and handed to the encoder, and every add() waits for the encoder.
   // (The all-in-one conversion decoded ahead of a slow Smooth export, and the
   // queued 3K/4K frames ran iOS Safari out of memory.)
-  const output = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart: false }), target: new MB.BufferTarget() });
+  const restorePreview = suspendPreview();
+  const wakeLock = await keepAwake();
+  const sink = await exportTarget(MB);
+  trace({ outputOnDisk: sink.onDisk });
+  const output = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart: false }), target: sink.target });
   const videoOut = new MB.CanvasSource(c, { codec, bitrate, keyFrameInterval: 2 });
   output.addVideoTrack(videoOut, { frameRate: outFps });
 
@@ -1526,9 +1582,12 @@ async function exportVideoExact() {
   } finally {
     r.gl.getExtension("WEBGL_lose_context")?.loseContext();
     interp?.dispose();
+    wakeLock?.release?.().catch(() => {});
     endProgress();
+    restorePreview();
   }
-  deliver(new Blob([output.target.buffer], { type: "video/mp4" }), `${baseName()}-bevgradz${boost ? `-${boost}fps` : ""}.mp4`);
+  const file = await sink.result();
+  deliver(file.type ? file : new Blob([file], { type: "video/mp4" }), `${baseName()}-bevgradz${boost ? `-${boost}fps` : ""}.mp4`);
 }
 
 async function exportVideoRealtime() {
