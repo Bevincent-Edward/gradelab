@@ -12,6 +12,7 @@
   <title>BevGradz</title>
   <link rel="manifest" href="manifest.webmanifest" />
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+  <link rel="icon" type="image/svg+xml" href="icons/logo.svg" />
   <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -44,7 +45,7 @@
     <section class="viewer" id="viewer">
       <div class="drop" id="drop">
         <div class="drop-inner">
-          <div class="drop-mark" aria-hidden="true"></div>
+          <img class="drop-mark" src="icons/logo.svg" alt="" width="96" height="96" />
           <h1 class="drop-title">Grade your photos and videos</h1>
           <p class="drop-sub">Cinematic looks in one tap. Everything stays on your phone.</p>
           <label class="btn primary big" for="file">Choose from library</label>
@@ -101,7 +102,14 @@
 
     <aside class="panel" id="panel">
       <section class="group look-group" data-tab="looks">
-        <div class="group-head"><h2 id="lookName">Original</h2><button class="chip" id="auto" title="Neutralise colour cast and exposure before the look">Auto balance</button></div>
+        <div class="group-head">
+          <h2 id="lookName">Original</h2>
+          <div class="head-actions">
+            <button class="chip" id="removeLut" hidden>Remove LUT</button>
+            <button class="chip" id="auto" title="Neutralise colour cast and exposure before the look">Auto balance</button>
+          </div>
+        </div>
+        <input id="lutFile" type="file" accept=".cube,.CUBE" multiple hidden />
         <div id="intensityRow"></div>
       </section>
 
@@ -182,6 +190,7 @@
 
       <div class="panel-foot" data-tab="effects">
         <button class="btn ghost" id="reset">Reset all</button>
+        <button class="btn ghost" id="about">About &amp; credits</button>
         <button class="btn ghost mobile-only" id="exportLutMobile" disabled>Download .cube LUT</button>
       </div>
     </aside>
@@ -228,6 +237,26 @@
         <button class="btn ghost" value="cancel">Close</button>
         <button class="btn primary" value="ok" id="saveGo">Save</button>
       </div>
+    </form>
+  </dialog>
+
+  <dialog id="aboutDialog">
+    <form method="dialog" class="dialog about">
+      <h3>BevGradz</h3>
+      <p class="about-verse">“For God so loved the world…” John 3:16</p>
+      <p class="hint">Cinematic colour grading that runs entirely on your device. Your photos and videos are never uploaded.</p>
+      <h4>Film LUTs</h4>
+      <ul class="credits">
+        <li><strong>Film simulations from GlassMeter by Glass Works</strong> (glass-works.ai), CC BY 4.0. Film names describe the stocks these looks interpret; they are not affiliated with the film makers.</li>
+        <li><strong>Film looks from Derby</strong> (derbysocial.app), modelled from manufacturer datasheets, MIT licence, with the film model from RAWmakase (MIT).</li>
+        <li><strong>Cinematic LUTs by slay</strong> (slaycamera.com), CC BY 4.0.</li>
+      </ul>
+      <h4>Software</h4>
+      <ul class="credits">
+        <li><strong>Mediabunny</strong> for frame-exact video export, MPL-2.0.</li>
+      </ul>
+      <p class="hint">Licence texts are included with the app in <code>luts/licenses</code> and <code>vendor</code>.</p>
+      <div class="dialog-actions"><button class="btn primary" value="ok">Close</button></div>
     </form>
   </dialog>
 

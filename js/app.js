@@ -1,4 +1,4 @@
-import { BANDS, LUT_SIZE, autoCorrect, buildLut, curveTable, defaultParams, hueSwatch, labStats, lutToCube } from "./grade.js";
+import { BANDS, LUT_SIZE, autoCorrect, buildLut, curveTable, defaultParams, hueSwatch, labStats, lutToCube, parseCube } from "./grade.js";
 import { CATEGORIES, PALETTES, PRESETS } from "./presets.js";
 import { Renderer } from "./renderer.js";
 
@@ -321,6 +321,7 @@ function paramsForPreset(preset) {
     for (const [id, m] of Object.entries(mixer ?? {})) p.mixer[id] = { ...m };
     for (const [ch, pts] of Object.entries(curves ?? {})) p.curves[ch] = pts.map((q) => [...q]);
     if (palette) p.palette = [...palette];
+    if (preset.lut) p.extLut = lutFull.get(preset.lut) ?? lutThumb.get(preset.lut) ?? null;
   }
   // A reference look, framing and strength are the user's choices, not the look's.
   for (const k of ["match", "matchAmt", "letterbox", "intensity"]) p[k] = state.params[k];
@@ -337,14 +338,155 @@ function applyPreset(preset) {
   state.presetId = preset?.id ?? null;
   state.peek = null;
   $("peek").hidden = true;
+  $("removeLut").hidden = !preset?.userLut;
   syncAll();
   onParamsChanged();
+  // Film LUTs apply instantly from their preview copy, then switch to the
+  // full-precision table as soon as it has downloaded.
+  if (preset?.lut && !lutFull.has(preset.lut)) {
+    ensureFullLut(preset.lut).then(() => {
+      if (state.presetId !== preset.id) return;
+      state.params.extLut = lutFull.get(preset.lut);
+      onParamsChanged();
+    }).catch(() => { /* keep the preview copy */ });
+  }
 }
+
+// ---------------------------------------------------------------- film LUT library
+
+const lutFull = new Map(); // id -> { size: 33, data } full precision
+const lutThumb = new Map(); // id -> { size: 17, data } shipped in pack.json
+const lutLoading = new Map();
+let lutSources = {};
+const LUT_COLLECTION = { glassmeter: (e) => (e.bw ? "B&W Film" : "Film Emulation"), derby: () => "Film Lab", slay: () => "Film Lab" };
+
+function decodeThumb(b64) {
+  const bin = atob(b64);
+  const data = new Float32Array(bin.length);
+  for (let i = 0; i < bin.length; i++) data[i] = bin.charCodeAt(i) / 255;
+  return { size: 17, data };
+}
+
+function ensureFullLut(id) {
+  if (!lutLoading.has(id)) {
+    lutLoading.set(id, fetch(`luts/${id}.bin`).then((r) => {
+      if (!r.ok) throw new Error(`LUT ${id} unavailable`);
+      return r.arrayBuffer();
+    }).then((buf) => {
+      const u = new Uint16Array(buf);
+      const data = new Float32Array(u.length);
+      for (let i = 0; i < u.length; i++) data[i] = u[i] / 65535;
+      lutFull.set(id, { size: 33, data });
+    }));
+  }
+  return lutLoading.get(id);
+}
+
+fetch("luts/pack.json").then((r) => r.json()).then((pack) => {
+  lutSources = pack.sources;
+  for (const e of pack.luts) {
+    lutThumb.set(e.id, decodeThumb(e.thumb));
+    const preset = {
+      id: `lut-${e.id}`, cat: LUT_COLLECTION[e.source](e), name: e.name,
+      note: pack.sources[e.source].credit, lut: e.id, p: { skinProtect: 0 },
+    };
+    PRESETS.push(preset);
+    addCategory(preset.cat);
+    addPresetButton(preset);
+  }
+  showCategory(state.category);
+  renderThumbnails();
+}).catch((err) => console.warn("Film LUT library unavailable:", err));
+
+// ---------------------------------------------------------------- your own LUTs (.cube import)
+
+const DB = "bevgradz", STORE = "luts";
+function openDb() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE, { keyPath: "id" });
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+}
+async function dbAll() {
+  const db = await openDb();
+  return new Promise((res, rej) => {
+    const q = db.transaction(STORE).objectStore(STORE).getAll();
+    q.onsuccess = () => res(q.result);
+    q.onerror = () => rej(q.error);
+  });
+}
+async function dbPut(rec) {
+  const db = await openDb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put(rec);
+    tx.oncomplete = res;
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function dbDelete(id) {
+  const db = await openDb();
+  return new Promise((res) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).delete(id);
+    tx.oncomplete = res;
+    tx.onerror = res;
+  });
+}
+
+function addUserLut(rec) {
+  const lut = { size: rec.size, data: new Float32Array(rec.data) };
+  lutFull.set(rec.id, lut);
+  lutThumb.set(rec.id, lut);
+  const preset = { id: `lut-${rec.id}`, cat: "My LUTs", name: rec.name, note: "Your LUT", lut: rec.id, userLut: true, p: { skinProtect: 0 } };
+  PRESETS.push(preset);
+  addPresetButton(preset);
+  return preset;
+}
+
+$("lutFile").addEventListener("change", async (e) => {
+  const files = [...e.target.files];
+  e.target.value = "";
+  let last = null;
+  for (const file of files) {
+    try {
+      const { size, data } = parseCube(await file.text());
+      const rec = { id: `user-${Date.now()}-${Math.round(Math.random() * 1e6)}`, name: file.name.replace(/\.cube$/i, ""), size, data: data.buffer };
+      try { await dbPut(rec); } catch { /* private browsing: keep it for this session only */ }
+      last = addUserLut(rec);
+    } catch (err) {
+      alert(`${file.name}: ${err.message}`);
+    }
+  }
+  if (last) {
+    showCategory("My LUTs");
+    renderThumbnails();
+    applyPreset(last);
+  }
+});
+
+$("removeLut").addEventListener("click", async () => {
+  const preset = PRESETS.find((x) => x.id === state.presetId);
+  if (!preset?.userLut) return;
+  await dbDelete(preset.lut).catch(() => {});
+  PRESETS.splice(PRESETS.indexOf(preset), 1);
+  document.querySelector(`.preset[data-id="${CSS.escape(preset.id)}"]`)?.remove();
+  for (const [k] of thumbs) if (k === preset) thumbs.delete(k);
+  applyPreset(null);
+});
+
+dbAll().then((recs) => {
+  recs.forEach(addUserLut);
+  showCategory(state.category);
+  if (recs.length) renderThumbnails();
+}).catch(() => { /* IndexedDB unavailable */ });
 
 const thumbCanvas = document.createElement("canvas");
 let thumbRenderer;
 const thumbs = new Map();
-for (const preset of [null, ...PRESETS]) {
+function addPresetButton(preset) {
   const btn = document.createElement("button");
   btn.className = "preset";
   btn.dataset.id = preset?.id ?? "";
@@ -371,8 +513,20 @@ for (const preset of [null, ...PRESETS]) {
     $("peek").hidden = true;
     requestDraw();
   });
+  btn.hidden = state.category !== "All" && preset?.cat !== state.category && preset !== null;
   $("presets").append(btn);
   thumbs.set(preset, c);
+}
+for (const preset of [null, ...PRESETS]) addPresetButton(preset);
+
+// The "Import .cube" tile lives in My LUTs.
+{
+  const tile = document.createElement("button");
+  tile.className = "preset import-tile";
+  tile.id = "importTile";
+  tile.innerHTML = `<span class="import-plus" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></span><span>Import .cube</span>`;
+  tile.addEventListener("click", () => $("lutFile").click());
+  $("presets").prepend(tile);
 }
 
 function showCategory(cat) {
@@ -381,16 +535,24 @@ function showCategory(cat) {
   document.querySelectorAll(".preset").forEach((el) => {
     el.hidden = cat !== "All" && el.dataset.cat !== cat && el.dataset.id !== "";
   });
+  $("importTile").hidden = cat !== "My LUTs";
+  // keep Original first, then the import tile, then the looks
+  if (cat === "My LUTs") $("presets").querySelector('.preset[data-id=""]').after($("importTile"));
   $("presets").scrollLeft = 0;
 }
-for (const cat of CATEGORIES) {
+function addCategory(cat, after) {
+  if ([...document.querySelectorAll(".cat")].some((el) => el.textContent === cat)) return;
   const b = document.createElement("button");
   b.className = "cat";
   b.setAttribute("role", "tab");
   b.textContent = cat;
   b.addEventListener("click", () => showCategory(cat));
-  $("cats").append(b);
+  const anchor = after && [...document.querySelectorAll(".cat")].find((el) => el.textContent === after);
+  if (anchor) anchor.after(b); else $("cats").append(b);
 }
+for (const cat of CATEGORIES) addCategory(cat);
+// the richest collections sit up front, right after Cinema Print
+["Film Emulation", "Film Lab", "B&W Film", "My LUTs"].reduce((prev, cat) => (addCategory(cat, prev), cat), "Cinema Print");
 showCategory(state.category);
 
 // ---------------------------------------------------------------- palette grade
@@ -502,18 +664,27 @@ function sampleSource(w = 240, h = 180) {
   return c;
 }
 
-function renderThumbnails() {
+// Thumbnails render a few at a time (visible collection first) so the app
+// stays responsive with 120+ looks on a phone.
+let thumbJob = 0;
+async function renderThumbnails() {
   if (!state.source) return;
+  const job = ++thumbJob;
   const sample = sampleSource();
   thumbRenderer ??= new Renderer(thumbCanvas);
   thumbCanvas.width = sample.width;
   thumbCanvas.height = sample.height;
   thumbRenderer.setSource(sample, sample.width, sample.height);
-  for (const [preset, target] of thumbs) {
+  const visible = (preset) => preset === null || state.category === "All" || preset.cat === state.category;
+  const order = [...thumbs].sort(([a], [b]) => visible(b) - visible(a));
+  for (let i = 0; i < order.length; i++) {
+    if (job !== thumbJob) return;
+    const [preset, target] = order[i];
     const p = paramsForPreset(preset);
     thumbRenderer.setLut(buildLut(p, 17), 17);
     thumbRenderer.render({ ...shaderOpts(p), intensity: 1, grain: 0, letterbox: 0 });
     target.getContext("2d").drawImage(thumbCanvas, 0, 0, target.width, target.height);
+    if (i % 6 === 5) await new Promise((r) => setTimeout(r, 0));
   }
 }
 
@@ -1022,6 +1193,7 @@ function exportSize() {
 }
 
 $("exportLutMobile").addEventListener("click", () => $("exportLut").click());
+$("about").addEventListener("click", () => $("aboutDialog").showModal());
 $("exportLut").addEventListener("click", () => {
   // The .cube carries the colour grade at the chosen strength; vignette and
   // grain are spatial and can't live in a LUT.

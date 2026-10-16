@@ -1,11 +1,12 @@
 import { PRO_LOOKS } from "./prolooks.js";
+import { CINEMA_LOOKS } from "./cinemalooks.js";
 
 // Looks are deliberately restrained: each one keeps skin protection on (except
 // B&W) and moves colour in OKLab, so subjects stay recognisable and textures
 // intact. Values are partial overrides of defaultParams(). Hues are OKLCH
 // degrees: red≈25, orange≈58, yellow≈100, green≈140, teal≈200, blue≈255, magenta≈340.
 
-export const CATEGORIES = ["Pro Looks", "All", "Trending", "Signature", "Cinematic", "Film Stock", "Aesthetic", "Film", "Moody", "Nature", "Portrait", "B&W"];
+export const CATEGORIES = ["Pro Looks", "Cinema Print", "All", "Trending", "Signature", "Cinematic", "Film Stock", "Aesthetic", "Film", "Moody", "Nature", "Portrait", "B&W"];
 
 // Curated colour schemes for palette grading (OKLCH hues).
 export const PALETTES = [
@@ -690,4 +691,4 @@ const BASE_PRESETS = [
 ];
 
 // Reference-matched looks first, then the hand-built library.
-export const PRESETS = [...PRO_LOOKS, ...BASE_PRESETS];
+export const PRESETS = [...PRO_LOOKS, ...CINEMA_LOOKS, ...BASE_PRESETS];

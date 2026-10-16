@@ -56,6 +56,10 @@ export function defaultParams() {
     dehaze: 0, // -100..100: negative adds airy haze, positive cuts it
     glow: 0, // 0..100 soft dreamy bloom
     rays: 0, // 0..100 light rays from the brightest light source
+    // an external creative LUT (film stock / imported .cube), applied after the grade
+    extLut: null, // { size, data: Float32Array (r fastest) }
+    extLutAmt: 100, // 0..100
+    extLutFirst: false, // true: LUT acts as the camera negative, the grade as the print
     letterbox: 0, // target aspect ratio, 0 = off
   };
 }
@@ -238,6 +242,7 @@ function prepare(p) {
     density: p.density / 100,
     cal: calibrationMatrix(p),
     curves: ["rgb", "r", "g", "b"].map((c) => (isIdentityCurve(p.curves[c]) ? null : curveTable(p.curves[c]))),
+    ext: p.extLut && p.extLutAmt > 0 ? { ...p.extLut, t: p.extLutAmt / 100, first: p.extLutFirst } : null,
   };
 }
 
@@ -319,6 +324,10 @@ function tone(x, p, k) {
 
 /** Grades one sRGB colour (0..1 components) and returns graded sRGB. */
 export function gradeColor(r, g, b, p, k = prepare(p)) {
+  if (k.ext?.first) {
+    const l = sampleLut(k.ext, r, g, b);
+    r += (l[0] - r) * k.ext.t; g += (l[1] - g) * k.ext.t; b += (l[2] - b) * k.ext.t;
+  }
   let lr = toLinear(r) * k.gains[0] * k.expo;
   let lg = toLinear(g) * k.gains[1] * k.expo;
   let lb = toLinear(b) * k.gains[2] * k.expo;
@@ -408,7 +417,53 @@ export function gradeColor(r, g, b, p, k = prepare(p)) {
   if (cr) out[0] = lookup(cr, out[0]);
   if (cg) out[1] = lookup(cg, out[1]);
   if (cb) out[2] = lookup(cb, out[2]);
+  if (k.ext && !k.ext.first) {
+    const l = sampleLut(k.ext, out[0], out[1], out[2]);
+    for (let i = 0; i < 3; i++) out[i] += (l[i] - out[i]) * k.ext.t;
+  }
   return out;
+}
+
+/** Trilinear lookup in an N^3 RGB lattice stored red-fastest (.cube order). */
+export function sampleLut({ size: n, data }, r, g, b) {
+  const f = (v) => Math.min(n - 1.000001, Math.max(0, v * (n - 1)));
+  const x = f(r), y = f(g), z = f(b);
+  const x0 = Math.floor(x), y0 = Math.floor(y), z0 = Math.floor(z);
+  const dx = x - x0, dy = y - y0, dz = z - z0;
+  const out = [0, 0, 0];
+  for (let c = 0; c < 3; c++) {
+    const at = (i, j, k) => data[((k * n + j) * n + i) * 3 + c];
+    const c00 = at(x0, y0, z0) * (1 - dx) + at(x0 + 1, y0, z0) * dx;
+    const c10 = at(x0, y0 + 1, z0) * (1 - dx) + at(x0 + 1, y0 + 1, z0) * dx;
+    const c01 = at(x0, y0, z0 + 1) * (1 - dx) + at(x0 + 1, y0, z0 + 1) * dx;
+    const c11 = at(x0, y0 + 1, z0 + 1) * (1 - dx) + at(x0 + 1, y0 + 1, z0 + 1) * dx;
+    out[c] = (c00 * (1 - dy) + c10 * dy) * (1 - dz) + (c01 * (1 - dy) + c11 * dy) * dz;
+  }
+  return out;
+}
+
+/** Parses a .cube file (3D LUT) into { size, data }, honouring DOMAIN_MIN/MAX. */
+export function parseCube(text) {
+  let size = 0, min = [0, 0, 0], max = [1, 1, 1];
+  const vals = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line[0] === "#") continue;
+    const parts = line.split(/\s+/);
+    const key = parts[0].toUpperCase();
+    if (key === "LUT_3D_SIZE") size = +parts[1];
+    else if (key === "LUT_1D_SIZE") throw new Error("1D LUTs aren't supported. Export it as a 3D .cube LUT.");
+    else if (key === "DOMAIN_MIN") min = parts.slice(1, 4).map(Number);
+    else if (key === "DOMAIN_MAX") max = parts.slice(1, 4).map(Number);
+    else if (/^[-+.\d]/.test(parts[0])) vals.push(+parts[0], +parts[1], +parts[2]);
+  }
+  if (!size || vals.length !== size ** 3 * 3) throw new Error("This doesn't look like a valid 3D .cube LUT.");
+  const data = new Float32Array(vals.length);
+  for (let i = 0; i < vals.length; i++) {
+    const c = i % 3;
+    data[i] = Math.min(1, Math.max(0, (vals[i] - min[c]) / (max[c] - min[c] || 1)));
+  }
+  return { size, data };
 }
 
 /** Bakes the grade into an N³ RGB float table, red varying fastest (.cube order). */
