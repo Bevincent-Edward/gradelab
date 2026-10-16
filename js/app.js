@@ -934,7 +934,12 @@ window.addEventListener("keyup", (e) => { if (e.key === "\\") hold(false); });
 
 // ---------------------------------------------------------------- loading
 
-$("file").addEventListener("change", (e) => e.target.files[0] && load(e.target.files[0]));
+$("file").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  // Reset so choosing the same file again still fires "change".
+  e.target.value = "";
+  if (f) load(f);
+});
 const drop = $("viewer");
 drop.addEventListener("dragover", (e) => { e.preventDefault(); $("drop").classList.add("dragging"); });
 drop.addEventListener("dragleave", () => $("drop").classList.remove("dragging"));
@@ -999,36 +1004,56 @@ const once = (el, ev) => new Promise((res) => el.addEventListener(ev, res, { onc
  * iOS Safari won't hand over video frames until playback has started, so
  * briefly play muted (allowed without a gesture), then seek to a nice frame.
  */
+const timeout = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * iOS Safari often won't start loading a video (or hand over frames) until it
+ * is asked to play, so: load, start a muted play straight away (allowed
+ * without a tap), wait for metadata with a timeout, then seek to a nice frame.
+ */
 async function primeVideo(url) {
-  video.muted = true;
-  video.src = url;
-  await new Promise((res, rej) => {
-    video.onloadedmetadata = res;
-    video.onerror = () => rej(new Error("This video format is not supported by your browser."));
-  });
-  try { await video.play(); } catch { /* autoplay blocked: frames still arrive after seeking */ }
   video.pause();
-  video.currentTime = Math.min(1, video.duration * 0.2);
-  await once(video, "seeked");
-  if (video.readyState < 2) await Promise.race([once(video, "loadeddata"), new Promise((r) => setTimeout(r, 1500))]);
+  video.muted = true;
+  video.playsInline = true;
+  video.src = url;
+  video.load();
+  const meta = new Promise((res, rej) => {
+    if (video.readyState >= 1) return res();
+    video.onloadedmetadata = () => res();
+    video.onerror = () => rej(new Error("This video couldn't be opened. Try a different clip, or export it from Photos as Most Compatible."));
+  });
+  const playing = video.play().catch(() => { /* autoplay refused: seeking still loads frames */ });
+  const ok = await Promise.race([meta.then(() => true), timeout(20000).then(() => false)]);
+  if (!ok) throw new Error("This video is taking too long to open. Please try picking it again.");
+  await Promise.race([playing, timeout(1500)]);
+  video.pause();
+  video.currentTime = Math.min(1, (video.duration || 1) * 0.2);
+  await Promise.race([once(video, "seeked"), timeout(4000)]);
+  if (video.readyState < 2) await Promise.race([once(video, "loadeddata"), timeout(3000)]);
   video.muted = false;
 }
 
+let loadToken = 0;
+
 async function load(file) {
   if (!renderer || state.exporting) return;
+  const token = ++loadToken; // a newer pick wins over a slower earlier one
   // iOS Files often hands over videos with an empty type, so trust the extension too.
   const isVideo = file.type.startsWith("video/") || (!file.type.startsWith("image/") && VIDEO_EXT.test(file.name));
   video.pause();
-  if (video.src) URL.revokeObjectURL(video.src);
-  state.source?.bitmap?.close?.();
+  // The current photo/video stays usable until the new file has opened.
+  const previous = state.source;
 
   if (isVideo) {
+    const oldUrl = video.src;
     try {
       await primeVideo(URL.createObjectURL(file));
     } catch (err) {
-      alert(err.message);
+      if (token === loadToken) alert(err.message);
       return;
     }
+    if (token !== loadToken) return;
+    if (oldUrl.startsWith("blob:")) URL.revokeObjectURL(oldUrl);
     state.source = { kind: "video", file, name: file.name, width: video.videoWidth, height: video.videoHeight, fps: null };
     uploadVideoPreview();
     probeVideo(state.source);
@@ -1037,12 +1062,19 @@ async function load(file) {
     try {
       decoded = await decodeImage(file);
     } catch (err) {
-      alert(err.message);
+      if (token === loadToken) alert(err.message);
       return;
+    }
+    if (token !== loadToken) return;
+    if (video.src.startsWith("blob:")) {
+      URL.revokeObjectURL(video.src);
+      video.removeAttribute("src");
+      video.load();
     }
     state.source = { kind: "image", file, name: file.name, ...decoded };
     renderer.setSource(decoded.bitmap, decoded.width, decoded.height);
   }
+  if (previous?.bitmap && previous.bitmap !== state.source.bitmap) previous.bitmap.close?.();
   view.zoom = 1;
   view.panX = view.panY = 0;
 
@@ -1224,9 +1256,10 @@ $("export").addEventListener("click", () => {
     $("fpsTarget").onchange = () => $("export").click();
   }
   const target = isVideo ? +$("fpsTarget").value : 0;
+  const capNote = target > 61 && Math.max(w, h) > 1920 ? " at 1080p (the highest phones can encode at 120 fps)" : "";
   $("exportHint").textContent = isVideo
     ? target
-      ? `Creates new in-between frames with motion interpolation for smooth ${target} fps (from ${fps}), grades every frame at ${w}×${h} and keeps the original sound. Takes longer than a normal export; keep this screen open.`
+      ? `Creates new in-between frames with motion interpolation for smooth ${target} fps (from ${fps})${capNote}, grades every frame and keeps the original sound. Takes longer than a normal export; keep this screen open.`
       : `Grades every frame at ${w}×${h} and keeps ${fps} and the original sound. Keep this screen open until it finishes.`
     : capped
       ? `Saved at ${w}×${h} — the largest image this browser allows (original ${state.source.width}×${state.source.height}).`
@@ -1305,6 +1338,20 @@ async function exportVideo() {
   }
 }
 
+/** Largest size ≤ the clip that this device can encode at the output frame rate. */
+async function pickEncoding(MB, dw, dh, fps) {
+  const longCap = fps > 61 ? 1920 : 3840;
+  const caps = [longCap, 2560, 1920, 1280].filter((v, i, a) => v <= longCap && a.indexOf(v) === i);
+  for (const cap of caps) {
+    const s = Math.min(1, cap / Math.max(dw, dh), Math.sqrt(MAX_CANVAS_PIXELS / (dw * dh)));
+    const w = Math.round((dw * s) / 2) * 2, h = Math.round((dh * s) / 2) * 2;
+    const bitrate = Math.round(Math.min(IS_IOS ? 40e6 : 60e6, Math.max(6e6, w * h * fps * 0.09)));
+    const codec = await MB.getFirstEncodableVideoCodec(["avc", "hevc"], { width: w, height: h, bitrate });
+    if (codec) return { size: { w, h }, codec, bitrate };
+  }
+  throw new Error("This device can't encode video at that frame rate. Try Original or Smooth 60 fps.");
+}
+
 async function exportVideoExact() {
   if (!("VideoEncoder" in window)) throw new Error("WebCodecs not available");
   const MB = await loadMediabunny();
@@ -1312,19 +1359,21 @@ async function exportVideoExact() {
   const track = await input.getPrimaryVideoTrack();
   if (!track || !(await track.canDecode())) throw new Error("Video track can't be decoded here");
 
-  // Output at the display orientation, capped only by the browser's canvas limit.
-  const dw = track.displayWidth, dh = track.displayHeight;
-  const s = Math.min(1, Math.sqrt(MAX_CANVAS_PIXELS / (dw * dh)));
-  const size = { w: Math.round((dw * s) / 2) * 2, h: Math.round((dh * s) / 2) * 2 };
-  const { c, r } = exportRenderer(size);
-  const codec = await MB.getFirstEncodableVideoCodec(["avc", "hevc"], { width: size.w, height: size.h });
-  if (!codec) throw new Error("No supported video encoder");
-
-  const job = { cancelled: false };
-  state.exporting = job;
   // Optional frame-rate boost: new in-between frames from motion interpolation.
   const target = +$("fpsTarget").value || 0;
   const boost = target > (state.source.fps || 30) * 1.05 ? target : 0;
+  const outFps = boost || state.source.fps || 30;
+
+  // Output at the display orientation, sized to what phone encoders handle:
+  // above 60 fps that's 1080p (H.264/HEVC levels top out at 4K60), and the
+  // bitrate scales with pixels × frame rate like a camera's. Unbounded sizes
+  // and "very high" quality at 4K120 ran iOS Safari out of memory.
+  const dw = track.displayWidth, dh = track.displayHeight;
+  const { size, codec, bitrate } = await pickEncoding(MB, dw, dh, outFps);
+  const { c, r } = exportRenderer(size);
+
+  const job = { cancelled: false };
+  state.exporting = job;
   let interp = null;
   if (boost) {
     try { interp = new FrameInterpolator(size.w, size.h); } catch (err) { console.warn("Interpolation unavailable, repeating frames:", err); }
@@ -1346,7 +1395,7 @@ async function exportVideoExact() {
       forceTranscode: true,
       allowTransformationMetadata: false, // bake rotation in, so bars and rays are upright
       codec,
-      quality: MB.QUALITY_VERY_HIGH,
+      bitrate,
       width: size.w,
       height: size.h,
       fit: "fill",
