@@ -1138,14 +1138,14 @@ async function probeVideo(source) {
     const MB = await loadMediabunny();
     const input = new MB.Input({ formats: MB.ALL_FORMATS, source: new MB.BlobSource(source.file) });
     const track = await input.getPrimaryVideoTrack();
-    if (track) source.fps = (await track.computePacketStats(240)).averagePacketRate;
+    if (track) source.fps = await measureFps(track);
     if (state.source === source) showDims();
   } catch { /* unknown container: the export falls back to real-time capture */ }
 }
 
 function showDims() {
   const src = state.source;
-  const fps = src.fps ? `, ${Math.round(src.fps)} fps` : "";
+  const fps = src.kind !== "video" ? "" : src.fps ? `, ${Math.round(src.fps)} fps` : ", reading frame rate…";
   $("dims").textContent = `${src.width} × ${src.height}${fps}`;
 }
 video.requestVideoFrameCallback(onVideoFrame);
@@ -1250,13 +1250,13 @@ $("export").addEventListener("click", () => {
   const fps = state.source.fps ? `${Math.round(state.source.fps)} fps` : "the original frame rate";
   $("fpsOpts").hidden = !isVideo;
   if (isVideo) {
-    const src = state.source.fps || 30;
-    for (const o of $("fpsTarget").options) o.disabled = +o.value !== 0 && +o.value <= src * 1.05;
+    const src = state.source.fps || 0;
+    for (const o of $("fpsTarget").options) o.disabled = +o.value !== 0 && src > 0 && +o.value <= src * 1.05;
     if ($("fpsTarget").selectedOptions[0]?.disabled) $("fpsTarget").value = "0";
     $("fpsTarget").onchange = () => $("export").click();
   }
   const target = isVideo ? +$("fpsTarget").value : 0;
-  const capNote = target > 61 && Math.max(w, h) > 1920 ? " at 1080p (the highest phones can encode at 120 fps)" : "";
+  const capNote = "";
   $("exportHint").textContent = isVideo
     ? target
       ? `Creates new in-between frames with motion interpolation for smooth ${target} fps (from ${fps})${capNote}, grades every frame and keeps the original sound. Takes longer than a normal export; keep this screen open.`
@@ -1333,24 +1333,54 @@ async function exportVideo() {
     return await exportVideoExact();
   } catch (err) {
     if (err?.name === "AbortError") throw err;
+    // Smooth exports need the frame-exact path; real-time screen capture of a
+    // large clip is heavy on a phone and can't create in-between frames.
+    if (+$("fpsTarget").value) {
+      throw new Error(`Smooth export isn't possible for this clip on this device (${err.message}). Try Original frame rate.`);
+    }
     console.warn("Frame-exact export unavailable, using real-time capture:", err);
     return exportVideoRealtime();
   }
 }
 
-/** Largest size ≤ the clip that this device can encode at the output frame rate. */
+
+
+/**
+ * Keeps the clip's frame rate and finds the largest size this device can
+ * encode at that rate: asks the encoder directly for each size, HEVC first
+ * above 60 fps (H.264 levels stop at 4K60; iPhone records 4K120 in HEVC).
+ */
 async function pickEncoding(MB, dw, dh, fps) {
-  const longCap = fps > 61 ? 1920 : 3840;
-  const caps = [longCap, 2560, 1920, 1280].filter((v, i, a) => v <= longCap && a.indexOf(v) === i);
-  for (const cap of caps) {
-    const s = Math.min(1, cap / Math.max(dw, dh), Math.sqrt(MAX_CANVAS_PIXELS / (dw * dh)));
+  const longSide = Math.max(dw, dh);
+  const sizes = [longSide, 3840, 2560, 1920, 1280].filter((v, i, a) => v <= longSide && a.indexOf(v) === i);
+  const codecs = fps > 61 ? ["hevc", "avc"] : ["avc", "hevc"];
+  for (const cap of sizes) {
+    const s = Math.min(1, cap / longSide, Math.sqrt(MAX_CANVAS_PIXELS / (dw * dh)));
     const w = Math.round((dw * s) / 2) * 2, h = Math.round((dh * s) / 2) * 2;
-    const bitrate = Math.round(Math.min(IS_IOS ? 40e6 : 60e6, Math.max(6e6, w * h * fps * 0.09)));
-    const codec = await MB.getFirstEncodableVideoCodec(["avc", "hevc"], { width: w, height: h, bitrate });
-    if (codec) return { size: { w, h }, codec, bitrate };
+    for (const codec of codecs) {
+      const perPixel = codec === "hevc" ? 0.06 : 0.09;
+      const bitrate = Math.round(Math.min(IS_IOS ? 40e6 : 80e6, Math.max(6e6, w * h * fps * perPixel)));
+      try {
+        if (await MB.canEncodeVideo(codec, { width: w, height: h, bitrate, frameRate: fps })) return { size: { w, h }, codec, bitrate };
+      } catch { /* try the next option */ }
+    }
   }
-  throw new Error("This device can't encode video at that frame rate. Try Original or Smooth 60 fps.");
+  throw new Error(`this device can't encode video at ${Math.round(fps)} fps`);
 }
+
+/** Real frame rate of a video track, measured from its frames. */
+async function measureFps(track) {
+  const stats = await track.computePacketStats(600);
+  return stats.averagePacketRate > 0 ? stats.averagePacketRate : null;
+}
+
+// Export "flight recorder": if iOS kills the tab mid-export (out of memory),
+// the next launch can say exactly where it stopped, so the cause can be fixed.
+const TRACE_KEY = "bevgradz.exportTrace";
+function trace(data) {
+  try { localStorage.setItem(TRACE_KEY, JSON.stringify({ ...JSON.parse(localStorage.getItem(TRACE_KEY) || "{}"), ...data, at: Date.now() })); } catch { /* storage unavailable */ }
+}
+function clearTrace() { try { localStorage.removeItem(TRACE_KEY); } catch { /* ignore */ } }
 
 async function exportVideoExact() {
   if (!("VideoEncoder" in window)) throw new Error("WebCodecs not available");
@@ -1358,18 +1388,25 @@ async function exportVideoExact() {
   const input = new MB.Input({ formats: MB.ALL_FORMATS, source: new MB.BlobSource(state.source.file) });
   const track = await input.getPrimaryVideoTrack();
   if (!track || !(await track.canDecode())) throw new Error("Video track can't be decoded here");
+  const audioTrack = await input.getPrimaryAudioTrack();
+  const duration = (await input.computeDuration()) || video.duration || 1;
+  const srcFps = (await measureFps(track)) || state.source.fps || 30;
+  state.source.fps = srcFps;
+  showDims();
+  clearTrace();
+  trace({ stage: "starting", source: `${track.displayWidth}x${track.displayHeight}`, sourceCodec: track.codec, sourceFps: state.source.fps,
+    duration: +duration.toFixed(1), fileMB: +(state.source.file.size / 1e6).toFixed(1), device: navigator.userAgent.replace(/^.*?\(|\).*$/g, "") });
 
   // Optional frame-rate boost: new in-between frames from motion interpolation.
   const target = +$("fpsTarget").value || 0;
-  const boost = target > (state.source.fps || 30) * 1.05 ? target : 0;
-  const outFps = boost || state.source.fps || 30;
+  const boost = target > srcFps * 1.05 ? target : 0;
+  const outFps = boost || srcFps;
 
   // Output at the display orientation, sized to what phone encoders handle:
   // above 60 fps that's 1080p (H.264/HEVC levels top out at 4K60), and the
-  // bitrate scales with pixels × frame rate like a camera's. Unbounded sizes
-  // and "very high" quality at 4K120 ran iOS Safari out of memory.
-  const dw = track.displayWidth, dh = track.displayHeight;
-  const { size, codec, bitrate } = await pickEncoding(MB, dw, dh, outFps);
+  // bitrate scales with pixels × frame rate like a camera's.
+  const { size, codec, bitrate } = await pickEncoding(MB, track.displayWidth, track.displayHeight, outFps);
+  trace({ stage: "encoder ready", mode: boost ? `smooth ${boost}` : "original", output: `${size.w}x${size.h}@${Math.round(outFps)}`, codec, mbps: Math.round(bitrate / 1e6) });
   const { c, r } = exportRenderer(size);
 
   const job = { cancelled: false };
@@ -1378,83 +1415,97 @@ async function exportVideoExact() {
   if (boost) {
     try { interp = new FrameInterpolator(size.w, size.h); } catch (err) { console.warn("Interpolation unavailable, repeating frames:", err); }
   }
-  let prevTs = null, nextT = 0;
   startProgress(boost
     ? `Creating smooth ${boost} fps video — keep this screen open`
     : `Grading ${state.source.fps ? Math.round(state.source.fps) + " fps " : ""}video — keep this screen open`);
 
-  const output = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart: "in-memory" }), target: new MB.BufferTarget() });
-  const opts = shaderOpts();
-  const scratch = document.createElement("canvas");
-  let frameUpload = true; // VideoFrame → texture, unless this browser can't
-  const conversion = await MB.Conversion.init({
-    input,
-    output,
-    showWarnings: false,
-    video: {
-      forceTranscode: true,
-      allowTransformationMetadata: false, // bake rotation in, so bars and rays are upright
-      codec,
-      bitrate,
-      width: size.w,
-      height: size.h,
-      fit: "fill",
-      processedWidth: size.w,
-      processedHeight: size.h,
-      process: (sample) => {
-        if (boost) return boostFrames(sample);
-        if (frameUpload) {
-          const frame = sample.toVideoFrame();
-          try {
-            r.setSource(frame, frame.displayWidth, frame.displayHeight);
-          } catch {
-            frameUpload = false;
-          } finally {
-            frame.close();
-          }
-        }
-        if (!frameUpload) {
-          scratch.width = size.w;
-          scratch.height = size.h;
-          sample.draw(scratch.getContext("2d"), 0, 0, size.w, size.h);
-          r.setSource(scratch, size.w, size.h);
-        }
-        r.render({ ...opts, seed: sample.timestamp % 1 });
-        return c;
-      },
-    },
-  });
-  // Emits every output frame on the boosted grid between the previous source
-  // frame and this one; each is interpolated at its exact instant, then graded.
-  function boostFrames(sample) {
-    const frame = sample.toVideoFrame();
-    if (interp) interp.push(frame);
-    else { scratch.width = size.w; scratch.height = size.h; scratch.getContext("2d").drawImage(frame, 0, 0, size.w, size.h); }
-    frame.close();
-    const ts = sample.timestamp, step = 1 / boost;
-    if (prevTs === null) nextT = ts;
-    const out = [];
-    while (nextT <= ts + 1e-6) {
-      const t = prevTs === null || ts === prevTs ? 1 : (nextT - prevTs) / (ts - prevTs);
-      const img = interp ? interp.render(Math.min(1, Math.max(0, t))) : scratch;
-      r.setSource(img, size.w, size.h);
-      r.render({ ...opts, seed: nextT % 1 });
-      const vf = new VideoFrame(c, { timestamp: Math.round(nextT * 1e6), duration: Math.round(step * 1e6) });
-      out.push(new MB.VideoSample(vf, { timestamp: nextT, duration: step }));
-      nextT += step;
-    }
-    prevTs = ts;
-    return out;
-  }
-  if (!conversion.isValid) throw new Error("This video can't be converted here");
-  conversion.onProgress = (p) => ($("progressFill").style.width = `${p * 100}%`);
-  $("cancelExport").onclick = () => { job.cancelled = true; conversion.cancel(); };
+  // Strictly pull-based pipeline, so memory stays flat however slow the work
+  // per frame is: a frame is decoded only after the previous one has been
+  // graded and handed to the encoder, and every add() waits for the encoder.
+  // (The all-in-one conversion decoded ahead of a slow Smooth export, and the
+  // queued 3K/4K frames ran iOS Safari out of memory.)
+  const output = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart: false }), target: new MB.BufferTarget() });
+  const videoOut = new MB.CanvasSource(c, { codec, bitrate, keyFrameInterval: 2 });
+  output.addVideoTrack(videoOut, { frameRate: outFps });
 
+  // The soundtrack is copied packet for packet, never re-encoded.
+  let audioOut = null, audioPackets = null, audioConfig = null, pendingAudio = null, firstAudio = true;
+  if (audioTrack) {
+    try {
+      audioConfig = await audioTrack.getDecoderConfig();
+      if (audioTrack.codec && audioConfig) {
+        audioOut = new MB.EncodedAudioPacketSource(audioTrack.codec);
+        output.addAudioTrack(audioOut);
+        audioPackets = new MB.EncodedPacketSink(audioTrack).packets()[Symbol.asyncIterator]();
+      }
+    } catch (err) {
+      console.warn("Audio could not be copied:", err);
+      audioOut = null;
+    }
+  }
+  // Feed audio up to the video's current time, so the muxer can interleave
+  // instead of holding a whole track in memory.
+  async function feedAudio(until) {
+    if (!audioOut) return;
+    for (;;) {
+      if (!pendingAudio) {
+        const next = await audioPackets.next();
+        if (next.done) { audioOut = null; return; }
+        pendingAudio = next.value;
+      }
+      if (pendingAudio.timestamp > until) return;
+      await audioOut.add(pendingAudio, firstAudio ? { decoderConfig: audioConfig } : undefined);
+      firstAudio = false;
+      pendingAudio = null;
+    }
+  }
+
+  await output.start();
+  const opts = shaderOpts();
+  const frames = new MB.CanvasSink(track, { width: size.w, height: size.h, fit: "fill", poolSize: 2 });
+  const emit = async (img, t, d) => {
+    r.setSource(img, size.w, size.h);
+    r.render({ ...opts, seed: t % 1 });
+    await videoOut.add(t, d);
+  };
+  const abort = () => { const e = new Error("Cancelled"); e.name = "AbortError"; return e; };
+  $("cancelExport").onclick = () => { job.cancelled = true; };
+
+  let prevTs = null, nextT = 0, traced = 0;
+  trace({ stage: "decoding first frame" });
   try {
-    await conversion.execute();
+    for await (const frame of frames.canvases()) {
+      if (job.cancelled) throw abort();
+      const ts = frame.timestamp;
+      if (!boost) {
+        await emit(frame.canvas, ts, frame.duration);
+      } else {
+        // Emit every output frame on the boosted grid between the previous
+        // source frame and this one, each interpolated at its exact instant.
+        if (interp) interp.push(frame.canvas);
+        if (prevTs === null) nextT = ts;
+        const step = 1 / boost;
+        while (nextT <= ts + 1e-6) {
+          if (job.cancelled) throw abort();
+          const t = prevTs === null || ts === prevTs ? 1 : (nextT - prevTs) / (ts - prevTs);
+          await emit(interp ? interp.render(Math.min(1, Math.max(0, t))) : frame.canvas, nextT, step);
+          nextT += step;
+        }
+        prevTs = ts;
+      }
+      await feedAudio(ts + 0.5);
+      const pct = Math.min(99, (ts / duration) * 100);
+      $("progressFill").style.width = `${pct}%`;
+      if (++traced % 15 === 0) trace({ stage: "encoding", percent: Math.round(pct), atSecond: +ts.toFixed(1) });
+    }
+    await feedAudio(Infinity);
+    trace({ stage: "writing file" });
+    await output.finalize();
+    clearTrace();
   } catch (err) {
-    if (job.cancelled) { const e = new Error("Cancelled"); e.name = "AbortError"; throw e; }
-    throw err;
+    clearTrace();
+    try { await output.cancel(); } catch { /* already closed */ }
+    throw job.cancelled ? abort() : err;
   } finally {
     r.gl.getExtension("WEBGL_lose_context")?.loseContext();
     interp?.dispose();
@@ -1522,3 +1573,19 @@ async function exportVideoRealtime() {
 }
 
 syncAll();
+
+// After a crash, say what the last export was doing and offer the details.
+try {
+  const last = JSON.parse(localStorage.getItem(TRACE_KEY) || "null");
+  if (last && Date.now() - last.at < 3 * 24 * 3600 * 1000) {
+    const where = last.stage === "encoding" ? `at ${last.percent}%` : `while ${last.stage}`;
+    $("crashHint").textContent = `Your last export (${last.mode ?? "video"}, ${last.source ?? ""} ${last.sourceCodec ?? ""}) stopped ${where}. iPhone closed BevGradz, most likely because it ran out of memory. Tap Copy details and send them, so this can be fixed.`;
+    $("crashCopy").onclick = async (e) => {
+      e.preventDefault();
+      const text = `BevGradz export report: ${JSON.stringify(last)}`;
+      try { await navigator.clipboard.writeText(text); $("crashCopy").textContent = "Copied"; } catch { prompt("Copy this:", text); }
+    };
+    $("crashDialog").addEventListener("close", clearTrace, { once: true });
+    $("crashDialog").showModal();
+  }
+} catch { /* no storage */ }
