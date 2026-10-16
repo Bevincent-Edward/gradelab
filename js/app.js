@@ -1,6 +1,7 @@
 import { BANDS, LUT_SIZE, autoCorrect, buildLut, curveTable, defaultParams, hueSwatch, labStats, lutToCube, parseCube } from "./grade.js";
 import { CATEGORIES, PALETTES, PRESETS } from "./presets.js";
 import { Renderer } from "./renderer.js";
+import { FrameInterpolator } from "./interpolate.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -1215,12 +1216,22 @@ $("export").addEventListener("click", () => {
   $("photoOpts").hidden = isVideo;
   $("exportGo").textContent = capped ? "Export" : "Export full resolution";
   const fps = state.source.fps ? `${Math.round(state.source.fps)} fps` : "the original frame rate";
+  $("fpsOpts").hidden = !isVideo;
+  if (isVideo) {
+    const src = state.source.fps || 30;
+    for (const o of $("fpsTarget").options) o.disabled = +o.value !== 0 && +o.value <= src * 1.05;
+    if ($("fpsTarget").selectedOptions[0]?.disabled) $("fpsTarget").value = "0";
+    $("fpsTarget").onchange = () => $("export").click();
+  }
+  const target = isVideo ? +$("fpsTarget").value : 0;
   $("exportHint").textContent = isVideo
-    ? `Grades every frame at ${w}×${h} and keeps ${fps} and the original sound. Keep this screen open until it finishes.`
+    ? target
+      ? `Creates new in-between frames with motion interpolation for smooth ${target} fps (from ${fps}), grades every frame at ${w}×${h} and keeps the original sound. Takes longer than a normal export; keep this screen open.`
+      : `Grades every frame at ${w}×${h} and keeps ${fps} and the original sound. Keep this screen open until it finishes.`
     : capped
       ? `Saved at ${w}×${h} — the largest image this browser allows (original ${state.source.width}×${state.source.height}).`
       : `Saved at the original ${w}×${h} — no resizing or sharpening.`;
-  $("exportDialog").showModal();
+  if (!$("exportDialog").open) $("exportDialog").showModal();
 });
 // Started straight from the button tap: iOS only allows audio and playback
 // to start inside a user gesture, and the video export needs both.
@@ -1311,7 +1322,17 @@ async function exportVideoExact() {
 
   const job = { cancelled: false };
   state.exporting = job;
-  startProgress(`Grading ${state.source.fps ? Math.round(state.source.fps) + " fps " : ""}video — keep this screen open`);
+  // Optional frame-rate boost: new in-between frames from motion interpolation.
+  const target = +$("fpsTarget").value || 0;
+  const boost = target > (state.source.fps || 30) * 1.05 ? target : 0;
+  let interp = null;
+  if (boost) {
+    try { interp = new FrameInterpolator(size.w, size.h); } catch (err) { console.warn("Interpolation unavailable, repeating frames:", err); }
+  }
+  let prevTs = null, nextT = 0;
+  startProgress(boost
+    ? `Creating smooth ${boost} fps video — keep this screen open`
+    : `Grading ${state.source.fps ? Math.round(state.source.fps) + " fps " : ""}video — keep this screen open`);
 
   const output = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart: "in-memory" }), target: new MB.BufferTarget() });
   const opts = shaderOpts();
@@ -1332,6 +1353,7 @@ async function exportVideoExact() {
       processedWidth: size.w,
       processedHeight: size.h,
       process: (sample) => {
+        if (boost) return boostFrames(sample);
         if (frameUpload) {
           const frame = sample.toVideoFrame();
           try {
@@ -1353,6 +1375,28 @@ async function exportVideoExact() {
       },
     },
   });
+  // Emits every output frame on the boosted grid between the previous source
+  // frame and this one; each is interpolated at its exact instant, then graded.
+  function boostFrames(sample) {
+    const frame = sample.toVideoFrame();
+    if (interp) interp.push(frame);
+    else { scratch.width = size.w; scratch.height = size.h; scratch.getContext("2d").drawImage(frame, 0, 0, size.w, size.h); }
+    frame.close();
+    const ts = sample.timestamp, step = 1 / boost;
+    if (prevTs === null) nextT = ts;
+    const out = [];
+    while (nextT <= ts + 1e-6) {
+      const t = prevTs === null || ts === prevTs ? 1 : (nextT - prevTs) / (ts - prevTs);
+      const img = interp ? interp.render(Math.min(1, Math.max(0, t))) : scratch;
+      r.setSource(img, size.w, size.h);
+      r.render({ ...opts, seed: nextT % 1 });
+      const vf = new VideoFrame(c, { timestamp: Math.round(nextT * 1e6), duration: Math.round(step * 1e6) });
+      out.push(new MB.VideoSample(vf, { timestamp: nextT, duration: step }));
+      nextT += step;
+    }
+    prevTs = ts;
+    return out;
+  }
   if (!conversion.isValid) throw new Error("This video can't be converted here");
   conversion.onProgress = (p) => ($("progressFill").style.width = `${p * 100}%`);
   $("cancelExport").onclick = () => { job.cancelled = true; conversion.cancel(); };
@@ -1364,9 +1408,10 @@ async function exportVideoExact() {
     throw err;
   } finally {
     r.gl.getExtension("WEBGL_lose_context")?.loseContext();
+    interp?.dispose();
     endProgress();
   }
-  deliver(new Blob([output.target.buffer], { type: "video/mp4" }), `${baseName()}-bevgradz.mp4`);
+  deliver(new Blob([output.target.buffer], { type: "video/mp4" }), `${baseName()}-bevgradz${boost ? `-${boost}fps` : ""}.mp4`);
 }
 
 async function exportVideoRealtime() {
