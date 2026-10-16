@@ -1,16 +1,29 @@
 {
-  "name": "GradeLab — Photo & Video Colour Grading",
-  "short_name": "GradeLab",
-  "description": "Cinematic, aesthetic colour grading for photos and videos, processed on your device.",
+  "name": "BevGradz — Cinematic Photo & Video Grading",
+  "short_name": "BevGradz",
+  "description": "Cinematic colour grading for photos and videos, processed on your device.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#161616",
-  "theme_color": "#161616",
+  "background_color": "#0c0c0e",
+  "theme_color": "#0c0c0e",
   "icons": [
-    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
-    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
-    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
   ]
 }

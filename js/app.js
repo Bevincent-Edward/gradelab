@@ -28,6 +28,16 @@ try {
 } catch (err) {
   $("drop").querySelector(".drop-sub").textContent = err.message;
 }
+// Phones can drop the GPU context under memory pressure; rebuild instead of
+// leaving a black screen.
+canvas.addEventListener("webglcontextlost", (e) => e.preventDefault());
+canvas.addEventListener("webglcontextrestored", () => {
+  renderer = new Renderer(canvas);
+  lutParams = null;
+  if (state.source?.kind === "image") renderer.setSource(state.source.bitmap, state.source.width, state.source.height);
+  else if (state.source?.kind === "video") uploadVideoPreview();
+  requestDraw();
+});
 
 const state = {
   params: defaultParams(),
@@ -37,7 +47,8 @@ const state = {
   source: null, // { kind: "image" | "video", bitmap?, name, width, height }
   lut: null,
   split: false,
-  holdOriginal: false,
+  holdOriginal: false, // press-and-hold on the photo
+  viewMode: "edited", // "edited" | "original" | "split"
   band: BANDS[0].id,
   category: "Pro Looks",
   peek: null, // params of a look being hovered in the filmstrip
@@ -577,7 +588,10 @@ function draw() {
     lutDirty = false;
   }
   fitCanvas();
-  const split = state.holdOriginal ? 1.01 : state.split ? +(canvas.dataset.split ?? 0.5) : -1;
+  const showOriginal = state.holdOriginal || state.viewMode === "original";
+  const split = showOriginal ? 1.01 : state.viewMode === "split" ? +(canvas.dataset.split ?? 0.5) : -1;
+  placeSplitHandle();
+  $("modeTag").hidden = !showOriginal;
   renderer.render({ ...shaderOpts(p), seed: video.currentTime % 1, split });
 }
 
@@ -628,12 +642,29 @@ const setSplitFromEvent = (e) => {
   canvas.dataset.split = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
   requestDraw();
 };
-$("splitToggle").addEventListener("click", (e) => {
-  state.split = !state.split;
-  e.currentTarget.setAttribute("aria-pressed", state.split);
+// Compare control: one clear choice between the edit, the original, or a
+// draggable before/after split.
+function setViewMode(mode) {
+  state.viewMode = mode;
+  state.split = mode === "split";
+  $("viewMode").dataset.mode = mode;
+  document.querySelectorAll("#viewMode button").forEach((b) => b.setAttribute("aria-checked", b.dataset.mode === mode));
   $("stage").style.cursor = state.split ? "ew-resize" : "";
   requestDraw();
-});
+}
+document.querySelectorAll("#viewMode button").forEach((b) => b.addEventListener("click", () => setViewMode(b.dataset.mode)));
+// Taps on the control must not reach the stage's press-and-hold gesture.
+$("viewMode").addEventListener("pointerdown", (e) => e.stopPropagation());
+
+function placeSplitHandle() {
+  const h = $("splitHandle");
+  h.hidden = state.viewMode !== "split" || !state.source;
+  if (h.hidden) return;
+  const r = canvas.getBoundingClientRect(), st = $("stage").getBoundingClientRect();
+  h.style.left = `${r.left - st.left + r.width * +(canvas.dataset.split ?? 0.5)}px`;
+  h.style.top = `${Math.max(0, r.top - st.top)}px`;
+  h.style.bottom = `${Math.max(0, st.bottom - r.bottom)}px`;
+}
 const hold = (on) => { state.holdOriginal = on; requestDraw(); };
 
 // Stage gestures, phone-editor style:
@@ -725,8 +756,7 @@ document.querySelectorAll("#mtabs button").forEach((b) =>
     $("panel").scrollTop = 0;
   }),
 );
-$("holdOriginal").addEventListener("pointerdown", () => hold(true));
-for (const ev of ["pointerup", "pointerleave", "pointercancel"]) $("holdOriginal").addEventListener(ev, () => hold(false));
+
 window.addEventListener("keydown", (e) => { if (e.key === "\\" && !e.repeat) hold(true); });
 window.addEventListener("keyup", (e) => { if (e.key === "\\") hold(false); });
 
@@ -743,21 +773,53 @@ drop.addEventListener("drop", (e) => {
   if (f) load(f);
 });
 
+// Largest photo we keep on the GPU. iOS Safari silently fails (blank or black
+// canvas) above ~16.7 MP, which is what broke some 24/48 MP iPhone photos.
+const MAX_IMAGE_PIXELS = IS_IOS ? 16_777_216 : 50_000_000;
+
 /**
- * Decodes with EXIF orientation applied. Safari may reject createImageBitmap
- * options or some formats, so fall back to an <img>, which always honours
- * orientation (and decodes HEIC on recent iOS).
+ * Decodes a photo with EXIF orientation applied and returns something the GPU
+ * can always take. An <img> is tried first because it honours orientation on
+ * every browser and decodes HEIC on iOS; createImageBitmap is the fallback.
+ * Oversized photos are resampled once, with high-quality filtering, to the
+ * largest size this device can grade.
  */
 async function decodeImage(file) {
+  let src = null;
+  const url = URL.createObjectURL(file);
   try {
-    return await createImageBitmap(file, { imageOrientation: "from-image" });
-  } catch {
     const img = new Image();
-    img.src = URL.createObjectURL(file);
+    img.decoding = "async";
+    img.src = url;
     await img.decode();
-    return img;
+    src = img;
+  } catch {
+    try { src = await createImageBitmap(file); } catch { /* handled below */ }
   }
+  if (!src) {
+    URL.revokeObjectURL(url);
+    const heic = /\.(heic|heif)$/i.test(file.name) || /hei[cf]/i.test(file.type);
+    throw new Error(heic
+      ? "This browser can't open HEIC photos. Open BevGradz in Safari, or export the photo as JPEG first."
+      : "This file couldn't be opened as a photo. Try a JPEG, PNG or HEIC image.");
+  }
+  const w = src.naturalWidth || src.width, h = src.naturalHeight || src.height;
+  const maxSide = renderer.gl.getParameter(renderer.gl.MAX_TEXTURE_SIZE);
+  const s = Math.min(1, Math.sqrt(MAX_IMAGE_PIXELS / (w * h)), maxSide / Math.max(w, h));
+  if (s >= 1) return { bitmap: src, width: w, height: h, original: [w, h] };
+  const c = document.createElement("canvas");
+  c.width = Math.round(w * s);
+  c.height = Math.round(h * s);
+  const ctx = c.getContext("2d");
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(src, 0, 0, c.width, c.height);
+  src.close?.();
+  URL.revokeObjectURL(url);
+  return { bitmap: c, width: c.width, height: c.height, original: [w, h] };
 }
+
+const VIDEO_EXT = /\.(mov|mp4|m4v|webm|mkv|3gp|hevc)$/i;
 
 const once = (el, ev) => new Promise((res) => el.addEventListener(ev, res, { once: true }));
 
@@ -782,7 +844,8 @@ async function primeVideo(url) {
 
 async function load(file) {
   if (!renderer || state.exporting) return;
-  const isVideo = file.type.startsWith("video/");
+  // iOS Files often hands over videos with an empty type, so trust the extension too.
+  const isVideo = file.type.startsWith("video/") || (!file.type.startsWith("image/") && VIDEO_EXT.test(file.name));
   video.pause();
   if (video.src) URL.revokeObjectURL(video.src);
   state.source?.bitmap?.close?.();
@@ -794,24 +857,19 @@ async function load(file) {
       alert(err.message);
       return;
     }
-    state.source = { kind: "video", name: file.name, width: video.videoWidth, height: video.videoHeight };
-    renderer.setSource(video, video.videoWidth, video.videoHeight);
+    state.source = { kind: "video", file, name: file.name, width: video.videoWidth, height: video.videoHeight, fps: null };
+    uploadVideoPreview();
+    probeVideo(state.source);
   } else {
-    let bitmap;
+    let decoded;
     try {
-      bitmap = await decodeImage(file);
-    } catch {
-      alert("This image format is not supported by your browser.");
+      decoded = await decodeImage(file);
+    } catch (err) {
+      alert(err.message);
       return;
     }
-    const width = bitmap.naturalWidth || bitmap.width, height = bitmap.naturalHeight || bitmap.height;
-    const max = renderer.gl.getParameter(renderer.gl.MAX_TEXTURE_SIZE);
-    if (width > max || height > max) {
-      alert(`This image is larger than your device's GPU supports (${max}px per side).`);
-      return;
-    }
-    state.source = { kind: "image", bitmap, name: file.name, width, height };
-    renderer.setSource(bitmap, width, height);
+    state.source = { kind: "image", file, name: file.name, ...decoded };
+    renderer.setSource(decoded.bitmap, decoded.width, decoded.height);
   }
   view.zoom = 1;
   view.panX = view.panY = 0;
@@ -825,7 +883,7 @@ async function load(file) {
   $("export").disabled = false;
   $("exportLut").disabled = false;
   $("exportLutMobile").disabled = false;
-  $("dims").textContent = `${state.source.width} × ${state.source.height}`;
+  showDims();
   if (state.autoOn) {
     state.autoOn = false;
     state.params = paramsForPreset(PRESETS.find((p) => p.id === state.presetId));
@@ -840,13 +898,51 @@ async function load(file) {
 
 // ---------------------------------------------------------------- video playback
 
+// The preview only needs screen resolution. Uploading a 4K frame, building
+// its mipmaps and blurring it 60–120 times a second is what made playback
+// stutter, so large videos are scaled down for the preview only — exports
+// always use every full-resolution frame.
+const previewCanvas = document.createElement("canvas");
+function uploadVideoPreview() {
+  const { videoWidth: w, videoHeight: h } = video;
+  const s = Math.min(1, 1920 / Math.max(w, h));
+  if (s >= 1) return renderer.setSource(video, w, h);
+  const pw = Math.round(w * s), ph = Math.round(h * s);
+  if (previewCanvas.width !== pw || previewCanvas.height !== ph) {
+    previewCanvas.width = pw;
+    previewCanvas.height = ph;
+  }
+  previewCanvas.getContext("2d").drawImage(video, 0, 0, pw, ph);
+  renderer.setSource(previewCanvas, pw, ph);
+}
+
 function onVideoFrame() {
   if (state.source?.kind === "video") {
-    renderer.setSource(video, video.videoWidth, video.videoHeight);
+    uploadVideoPreview();
     draw();
     updateTime();
   }
   video.requestVideoFrameCallback(onVideoFrame);
+}
+
+let mediabunny;
+const loadMediabunny = () => (mediabunny ??= import("../vendor/mediabunny.min.mjs"));
+
+/** Reads the real frame rate from the file, for the export dialog. */
+async function probeVideo(source) {
+  try {
+    const MB = await loadMediabunny();
+    const input = new MB.Input({ formats: MB.ALL_FORMATS, source: new MB.BlobSource(source.file) });
+    const track = await input.getPrimaryVideoTrack();
+    if (track) source.fps = (await track.computePacketStats(240)).averagePacketRate;
+    if (state.source === source) showDims();
+  } catch { /* unknown container: the export falls back to real-time capture */ }
+}
+
+function showDims() {
+  const src = state.source;
+  const fps = src.fps ? `, ${Math.round(src.fps)} fps` : "";
+  $("dims").textContent = `${src.width} × ${src.height}${fps}`;
 }
 video.requestVideoFrameCallback(onVideoFrame);
 
@@ -866,9 +962,13 @@ $("play").addEventListener("click", () => {
   ensureAudioGraph();
   if (video.paused) video.play(); else video.pause();
 });
-video.addEventListener("play", () => ($("play").textContent = "❚❚"));
-video.addEventListener("pause", () => ($("play").textContent = "▶"));
-video.addEventListener("ended", () => ($("play").textContent = "▶"));
+const setPlaying = (on) => {
+  $("play").classList.toggle("playing", on);
+  $("play").setAttribute("aria-label", on ? "Pause" : "Play");
+};
+video.addEventListener("play", () => setPlaying(true));
+video.addEventListener("pause", () => setPlaying(false));
+video.addEventListener("ended", () => setPlaying(false));
 
 // Routing audio through Web Audio lets the export tap the soundtrack too.
 let audio;
@@ -934,7 +1034,7 @@ $("exportLut").addEventListener("click", () => {
       for (let r = 0; r < n; r++)
         for (const c of [r, g, b]) { lut[i] = c / (n - 1) + (lut[i] - c / (n - 1)) * t; i++; }
   const name = PRESETS.find((p) => p.id === state.presetId)?.name ?? "Custom";
-  download(new Blob([lutToCube(lut, n, `GradeLab ${name}`)], { type: "text/plain" }), `${baseName()}-${name.replace(/\W+/g, "-").toLowerCase()}.cube`);
+  download(new Blob([lutToCube(lut, n, `BevGradz ${name}`)], { type: "text/plain" }), `${baseName()}-${name.replace(/\W+/g, "-").toLowerCase()}.cube`);
 });
 
 $("export").addEventListener("click", () => {
@@ -942,8 +1042,9 @@ $("export").addEventListener("click", () => {
   const { w, h, capped } = exportSize();
   $("photoOpts").hidden = isVideo;
   $("exportGo").textContent = capped ? "Export" : "Export full resolution";
+  const fps = state.source.fps ? `${Math.round(state.source.fps)} fps` : "the original frame rate";
   $("exportHint").textContent = isVideo
-    ? `Renders every frame at ${w}×${h} in real time (${fmtTime(video.duration)}), keeping the audio. Output: ${pickVideoMime().label}. Keep this screen open until it finishes.`
+    ? `Grades every frame at ${w}×${h} and keeps ${fps} and the original sound. Keep this screen open until it finishes.`
     : capped
       ? `Saved at ${w}×${h} — the largest image this browser allows (original ${state.source.width}×${state.source.height}).`
       : `Saved at the original ${w}×${h} — no resizing or sharpening.`;
@@ -955,11 +1056,15 @@ $("exportGo").addEventListener("click", (e) => {
   e.preventDefault();
   $("exportDialog").close();
   if (state.source.kind === "image") exportPhoto(document.querySelector('input[name="fmt"]:checked').value);
-  else exportVideo().catch((err) => { console.error(err); alert(`Export failed: ${err.message}`); endProgress(); });
+  else exportVideo().catch((err) => {
+    console.error(err);
+    endProgress();
+    if (err?.name !== "AbortError") alert(`Export failed: ${err.message}`);
+  });
 });
 
-function exportRenderer() {
-  const { w, h } = exportSize();
+function exportRenderer(size = exportSize()) {
+  const { w, h } = size;
   const c = document.createElement("canvas");
   c.width = w;
   c.height = h;
@@ -975,7 +1080,7 @@ function exportPhoto(type) {
   c.toBlob((blob) => {
     r.gl.getExtension("WEBGL_lose_context")?.loseContext();
     if (!blob) return alert("Export failed: this image is too large for your browser.");
-    deliver(blob, `${baseName()}-graded.${type === "image/png" ? "png" : "jpg"}`);
+    deliver(blob, `${baseName()}-bevgradz.${type === "image/png" ? "png" : "jpg"}`);
   }, type, 0.95);
 }
 
@@ -1000,16 +1105,109 @@ function endProgress() {
   state.exporting = null;
 }
 
+/**
+ * Frame-exact export: decode every frame of the original file, grade it on the
+ * GPU and re-encode it with its original timestamp, so 60 and 120 fps clips
+ * keep every frame (and variable frame rate stays in sync). The soundtrack is
+ * copied across untouched. Falls back to real-time capture only when the
+ * browser lacks WebCodecs or the container can't be read.
+ */
 async function exportVideo() {
+  try {
+    return await exportVideoExact();
+  } catch (err) {
+    if (err?.name === "AbortError") throw err;
+    console.warn("Frame-exact export unavailable, using real-time capture:", err);
+    return exportVideoRealtime();
+  }
+}
+
+async function exportVideoExact() {
+  if (!("VideoEncoder" in window)) throw new Error("WebCodecs not available");
+  const MB = await loadMediabunny();
+  const input = new MB.Input({ formats: MB.ALL_FORMATS, source: new MB.BlobSource(state.source.file) });
+  const track = await input.getPrimaryVideoTrack();
+  if (!track || !(await track.canDecode())) throw new Error("Video track can't be decoded here");
+
+  // Output at the display orientation, capped only by the browser's canvas limit.
+  const dw = track.displayWidth, dh = track.displayHeight;
+  const s = Math.min(1, Math.sqrt(MAX_CANVAS_PIXELS / (dw * dh)));
+  const size = { w: Math.round((dw * s) / 2) * 2, h: Math.round((dh * s) / 2) * 2 };
+  const { c, r } = exportRenderer(size);
+  const codec = await MB.getFirstEncodableVideoCodec(["avc", "hevc"], { width: size.w, height: size.h });
+  if (!codec) throw new Error("No supported video encoder");
+
+  const job = { cancelled: false };
+  state.exporting = job;
+  startProgress(`Grading ${state.source.fps ? Math.round(state.source.fps) + " fps " : ""}video — keep this screen open`);
+
+  const output = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart: "in-memory" }), target: new MB.BufferTarget() });
+  const opts = shaderOpts();
+  const scratch = document.createElement("canvas");
+  let frameUpload = true; // VideoFrame → texture, unless this browser can't
+  const conversion = await MB.Conversion.init({
+    input,
+    output,
+    showWarnings: false,
+    video: {
+      forceTranscode: true,
+      allowTransformationMetadata: false, // bake rotation in, so bars and rays are upright
+      codec,
+      quality: MB.QUALITY_VERY_HIGH,
+      width: size.w,
+      height: size.h,
+      fit: "fill",
+      processedWidth: size.w,
+      processedHeight: size.h,
+      process: (sample) => {
+        if (frameUpload) {
+          const frame = sample.toVideoFrame();
+          try {
+            r.setSource(frame, frame.displayWidth, frame.displayHeight);
+          } catch {
+            frameUpload = false;
+          } finally {
+            frame.close();
+          }
+        }
+        if (!frameUpload) {
+          scratch.width = size.w;
+          scratch.height = size.h;
+          sample.draw(scratch.getContext("2d"), 0, 0, size.w, size.h);
+          r.setSource(scratch, size.w, size.h);
+        }
+        r.render({ ...opts, seed: sample.timestamp % 1 });
+        return c;
+      },
+    },
+  });
+  if (!conversion.isValid) throw new Error("This video can't be converted here");
+  conversion.onProgress = (p) => ($("progressFill").style.width = `${p * 100}%`);
+  $("cancelExport").onclick = () => { job.cancelled = true; conversion.cancel(); };
+
+  try {
+    await conversion.execute();
+  } catch (err) {
+    if (job.cancelled) { const e = new Error("Cancelled"); e.name = "AbortError"; throw e; }
+    throw err;
+  } finally {
+    r.gl.getExtension("WEBGL_lose_context")?.loseContext();
+    endProgress();
+  }
+  deliver(new Blob([output.target.buffer], { type: "video/mp4" }), `${baseName()}-bevgradz.mp4`);
+}
+
+async function exportVideoRealtime() {
   // Audio graph first, synchronously inside the tap (iOS gesture rule).
   const { rec } = ensureAudioGraph();
   const { c, r } = exportRenderer();
   const { mime, ext } = pickVideoMime();
-  // Exact frame-by-frame capture where supported; a fixed 30 fps stream otherwise.
+  // Exact frame-by-frame capture where supported; otherwise a stream at the
+  // clip's own frame rate (never a fixed 30 fps).
   let stream = c.captureStream(0);
   let track = stream.getVideoTracks()[0];
   if (typeof track.requestFrame !== "function") {
-    stream = c.captureStream(30);
+    stream = c.captureStream(Math.round(state.source.fps || 60));
     track = stream.getVideoTracks()[0];
   }
   for (const t of rec.stream.getAudioTracks()) stream.addTrack(t);
@@ -1054,7 +1252,7 @@ async function exportVideo() {
   await stopped;
   r.gl.getExtension("WEBGL_lose_context")?.loseContext();
   endProgress();
-  if (!job.cancelled) deliver(new Blob(chunks, { type: mime || "video/webm" }), `${baseName()}-graded.${ext}`);
+  if (!job.cancelled) deliver(new Blob(chunks, { type: mime || "video/webm" }), `${baseName()}-bevgradz.${ext}`);
 }
 
 syncAll();
