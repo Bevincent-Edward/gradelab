@@ -1138,7 +1138,11 @@ async function probeVideo(source) {
     const MB = await loadMediabunny();
     const input = new MB.Input({ formats: MB.ALL_FORMATS, source: new MB.BlobSource(source.file) });
     const track = await input.getPrimaryVideoTrack();
-    if (track) source.fps = await measureFps(track);
+    if (track) {
+      source.fps = await measureFps(track);
+      source.codec = track.codec;
+      source.duration = await input.computeDuration();
+    }
     if (state.source === source) showDims();
   } catch { /* unknown container: the export falls back to real-time capture */ }
 }
@@ -1249,6 +1253,18 @@ $("export").addEventListener("click", () => {
   $("exportGo").textContent = capped ? "Export" : "Export full resolution";
   const fps = state.source.fps ? `${Math.round(state.source.fps)} fps` : "the original frame rate";
   $("fpsOpts").hidden = !isVideo;
+  $("clipInfo").hidden = !isVideo;
+  $("convertTip").hidden = true;
+  if (isVideo) {
+    const src = state.source;
+    const codecName = { avc: "H.264", hevc: "HEVC", vp9: "VP9", av1: "AV1" }[src.codec] ?? (src.codec || "unknown codec");
+    const secs = src.duration ? `${src.duration.toFixed(1)} s` : "";
+    const engine = "VideoEncoder" in window ? "frame-exact export" : "real-time export only (this browser lacks WebCodecs)";
+    $("clipInfo").textContent = `Your clip as received: ${src.width}×${src.height}, ${codecName}, ${src.fps ? Math.round(src.fps) + " fps" : "frame rate unknown"}${secs ? ", " + secs : ""}, ${(src.file.size / 1e6).toFixed(0)} MB. Engine: ${engine}.`;
+    // iPhone records high frame rates in HEVC; a large clip handed over as
+    // H.264 at 30 fps or less is usually a converted "Most Compatible" copy.
+    $("convertTip").hidden = !(IS_IOS && src.fps && src.fps <= 31 && src.codec === "avc" && Math.max(src.width, src.height) >= 1920);
+  }
   if (isVideo) {
     const src = state.source.fps || 0;
     for (const o of $("fpsTarget").options) o.disabled = +o.value !== 0 && src > 0 && +o.value <= src * 1.05;
@@ -1274,6 +1290,7 @@ $("exportGo").addEventListener("click", (e) => {
   if (state.source.kind === "image") exportPhoto(document.querySelector('input[name="fmt"]:checked').value);
   else exportVideo().catch((err) => {
     console.error(err);
+    clearTrace(); // a reported error isn't a crash
     endProgress();
     if (err?.name !== "AbortError") alert(`Export failed: ${err.message}`);
   });
@@ -1395,7 +1412,7 @@ async function exportVideoExact() {
   showDims();
   clearTrace();
   trace({ stage: "starting", source: `${track.displayWidth}x${track.displayHeight}`, sourceCodec: track.codec, sourceFps: state.source.fps,
-    duration: +duration.toFixed(1), fileMB: +(state.source.file.size / 1e6).toFixed(1), device: navigator.userAgent.replace(/^.*?\(|\).*$/g, "") });
+    duration: +duration.toFixed(1), fileMB: +(state.source.file.size / 1e6).toFixed(1), engine: "frame-exact", device: navigator.userAgent });
 
   // Optional frame-rate boost: new in-between frames from motion interpolation.
   const target = +$("fpsTarget").value || 0;
@@ -1515,6 +1532,7 @@ async function exportVideoExact() {
 }
 
 async function exportVideoRealtime() {
+  trace({ stage: "real-time capture", engine: "realtime", webcodecs: "VideoEncoder" in window, source: `${state.source.width}x${state.source.height}`, sourceFps: state.source.fps, device: navigator.userAgent });
   // Audio graph first, synchronously inside the tap (iOS gesture rule).
   const { rec } = ensureAudioGraph();
   const { c, r } = exportRenderer();
@@ -1569,6 +1587,7 @@ async function exportVideoRealtime() {
   await stopped;
   r.gl.getExtension("WEBGL_lose_context")?.loseContext();
   endProgress();
+  clearTrace();
   if (!job.cancelled) deliver(new Blob(chunks, { type: mime || "video/webm" }), `${baseName()}-bevgradz.${ext}`);
 }
 

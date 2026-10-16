@@ -269,6 +269,12 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
   .import-tile > span:last-child { font-size: 12px; text-align: center; }
 }
 
+.clip-info { font: 500 13px var(--ui); color: var(--text); margin: 4px 0 10px; font-variant-numeric: tabular-nums; }
+.convert-tip {
+  font-size: 13px; line-height: 1.45; color: var(--text); background: var(--raise); border-radius: var(--r-m);
+  padding: 10px 12px; margin: 0 0 12px; border-left: 3px solid var(--amber);
+}
+.convert-tip em { font-style: normal; font-weight: 600; }
 .mtabs, .mobile-only { display: none; }
 
 @media (prefers-reduced-motion: reduce) {
